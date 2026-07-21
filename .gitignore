@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Search results
+author_papers/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# IDE
+.vscode/
+
+# macOS
+.DS_Store
