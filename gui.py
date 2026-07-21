@@ -25,8 +25,14 @@ from tkinter import messagebox, ttk
 
 # ---- paths ------------------------------------------------------------------
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-MAIN_SCRIPT = SCRIPT_DIR / "corresponding_author_fetcher.py"
+# Resolve base directory ? works in dev mode and when frozen by PyInstaller
+if getattr(sys, "frozen", False):
+    _BASE_DIR = Path(sys._MEIPASS)                 # PyInstaller temp directory
+else:
+    _BASE_DIR = Path(__file__).resolve().parent      # normal Python execution
+
+SCRIPT_DIR = _BASE_DIR
+MAIN_SCRIPT = _BASE_DIR / "corresponding_author_fetcher.py"
 
 
 # ---- main application class -------------------------------------------------
