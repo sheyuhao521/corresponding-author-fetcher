@@ -5,6 +5,15 @@
 
 ---
 
+## Demo
+
+GUI interface:
+
+![GUI Screenshot](images/gui.png)
+
+
+---
+
 ## 主要功能
 
 目前支持以下功能：
