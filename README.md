@@ -66,7 +66,7 @@ GUI interface:
 
 ## 使用方法
 
-运行python corresponding_author_fetcher.py
+运行python corresponding_author_fetcher.py（或.exe）
 输入：
 1.作者英文名（如she yuhao）
 2.作者隶属单位（如peking union medical college hospital）
