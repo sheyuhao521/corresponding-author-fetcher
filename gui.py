@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """GUI wrapper for corresponding_author_fetcher.py using Tkinter.
 
-Launches the existing CLI script as a subprocess, captures its combined
-stdout/stderr output in real time, and displays it in a scrollable text
+Calls the shared search API in a background thread, captures progress
+messages in real time, and displays them in a scrollable text
 widget.  No core business logic is duplicated here — all the work is
 delegated to corresponding_author_fetcher.py.
 
@@ -14,25 +14,12 @@ from __future__ import annotations
 
 import os
 import queue
-import subprocess
-import sys
 import threading
 import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
-
-
-# ---- paths ------------------------------------------------------------------
-
-# Resolve base directory ? works in dev mode and when frozen by PyInstaller
-if getattr(sys, "frozen", False):
-    _BASE_DIR = Path(sys._MEIPASS)                 # PyInstaller temp directory
-else:
-    _BASE_DIR = Path(__file__).resolve().parent      # normal Python execution
-
-SCRIPT_DIR = _BASE_DIR
-MAIN_SCRIPT = _BASE_DIR / "corresponding_author_fetcher.py"
+from corresponding_author_fetcher import SearchOptions, SearchResult, run_search
 
 
 # ---- main application class -------------------------------------------------
@@ -46,9 +33,10 @@ class CorrespondingAuthorGUI:
         self.root.geometry("900x700")
         self.root.minsize(760, 580)
 
-        # Subprocess state
-        self._proc: subprocess.Popen[str] | None = None
-        self._output_queue: queue.Queue[tuple[str, str | int]] = queue.Queue()
+        # Search worker state
+        self._cancel_event: threading.Event | None = None
+        self._worker_thread: threading.Thread | None = None
+        self._output_queue: queue.Queue[tuple[str, str | SearchResult]] = queue.Queue()
 
         # Results tracking for "Open Results Folder" button
         self._results_path: str = ""
@@ -56,7 +44,7 @@ class CorrespondingAuthorGUI:
         self._build_ui()
         self._poll_queue()
 
-        # Tear-down the subprocess when the window is closed
+        # Signal the worker thread when the window is closed
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # -- UI construction --------------------------------------------------
@@ -216,7 +204,7 @@ class CorrespondingAuthorGUI:
     # -- search orchestration ---------------------------------------------
 
     def _start_search(self) -> None:
-        """Validate form fields and launch the CLI script in a background thread."""
+        """Validate form fields and launch run_search() in a background thread."""
         name = self._strip_placeholder(
             self.name_var.get().strip(), "例如：She Yuhao")
         institution = self._strip_placeholder(
@@ -235,128 +223,66 @@ class CorrespondingAuthorGUI:
             return
 
         try:
-            if from_str:
-                int(from_str)
-            if to_str:
-                int(to_str)
+            from_year = int(from_str) if from_str else 1900
+            to_year = int(to_str) if to_str else time.localtime().tm_year
         except ValueError:
             messagebox.showerror(
                 "输入验证", "年份必须为整数。"
             )
             return
 
-        if from_str and to_str and int(from_str) > int(to_str):
+        if from_year > to_year:
             messagebox.showerror(
                 "输入验证", "起始年份不能晚于结束年份。"
             )
             return
 
-        # --- build command ---
-        cmd = [
-            sys.executable,
-            "-u",                    # unbuffered — needed for real-time output
-            str(MAIN_SCRIPT),
-            "--name", name,
-            "--institution", institution,
-            "--email", email,         # always pass (empty = no email)
-            "--from-year", from_str,
-            "--to-year", to_str,
-        ]
-        if self.skip_publisher_var.get():
-            cmd.append("--skip-publisher-page-check")
-        if self.no_download_var.get():
-            cmd.append("--no-download")
-
-        # Reset results tracking
-        self._results_path = ""
-        self.open_folder_btn.configure(state=tk.DISABLED)
+        options = SearchOptions(
+            name=name,
+            institution=institution,
+            email=email,
+            from_year=from_year,
+            to_year=to_year,
+            skip_publisher_page_check=self.skip_publisher_var.get(),
+            no_download=self.no_download_var.get(),
+        )
 
         # --- prepare UI ---
+        self._cancel_event = threading.Event()
         self._clear_output()
         self._set_running(True)
-        self._append_output(f"> {' '.join(cmd)}\n\n")
+        self._append_output(
+            f"> run_search(name={name!r}, institution={institution!r}, "
+            f"from_year={from_year}, to_year={to_year})\n\n"
+        )
 
         # --- launch ---
-        thread = threading.Thread(
-            target=self._run_subprocess, args=(cmd,), daemon=True
+        self._worker_thread = threading.Thread(
+            target=self._run_search,
+            args=(options, self._cancel_event),
+            daemon=True,
         )
-        thread.start()
+        self._worker_thread.start()
 
-    def _run_subprocess(self, cmd: list[str]) -> None:
-        """Execute *cmd* in a subprocess, pushing every line to the queue."""
+    def _run_search(self, options: SearchOptions, cancel_event: threading.Event) -> None:
+        """Execute run_search() in a worker thread, feeding output to queue."""
         try:
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,          # merge stderr → stdout
-                cwd=str(SCRIPT_DIR),
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            result = run_search(
+                options,
+                progress_callback=lambda message: self._output_queue.put(("output", message + "\n")),
+                cancel_event=cancel_event,
             )
-            # -- robust binary-mode reader with process-exit detection --
-            # On Windows the TextIOWrapper layer can fail to detect EOF
-            # when a child exits quickly, causing readline() to block
-            # forever.  We use a reader thread + polling loop so the pipe
-            # is always drained and process exit is reliably detected.
-            inner: queue.Queue[bytes | None] = queue.Queue()
-
-            def _reader() -> None:
-                """Read raw chunks from the pipe; push None on EOF/error."""
-                try:
-                    while True:
-                        chunk = self._proc.stdout.read(4096)
-                        if not chunk:            # EOF
-                            break
-                        inner.put(chunk)
-                except Exception:
-                    pass
-                finally:
-                    inner.put(None)               # sentinel
-
-            reader_thread = threading.Thread(target=_reader, daemon=True)
-            reader_thread.start()
-
-            buf = b""
-            while True:
-                try:
-                    item = inner.get(timeout=0.15)
-                    if item is None:
-                        break                     # reader signalled EOF
-                    buf += item
-                    # emit complete lines immediately for real-time output
-                    while b"\n" in buf:
-                        nl = buf.index(b"\n") + 1
-                        line = buf[:nl].decode("utf-8", errors="replace")
-                        buf = buf[nl:]
-                        self._output_queue.put(("output", line))
-                except queue.Empty:
-                    if self._proc.poll() is not None:
-                        # child exited — close pipe to unblock reader
-                        try:
-                            self._proc.stdout.close()
-                        except Exception:
-                            pass
-                        break
-
-            if buf:
-                self._output_queue.put(
-                    ("output", buf.decode("utf-8", errors="replace"))
-                )
-            returncode = self._proc.wait()
-            self._output_queue.put(("done", returncode))
+            self._output_queue.put(("result", result))
         except Exception as exc:
             self._output_queue.put(("error", str(exc)))
-        finally:
-            self._proc = None
 
     def _cancel_search(self) -> None:
-        """Terminate a running search gracefully."""
-        if self._proc is not None and self._proc.poll() is None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
+        """Signal cancellation to the running search thread."""
+        if self._cancel_event is not None:
+            self._cancel_event.set()
             self._append_output("\n[\u5df2取消\u68c0\u7d22]\n")
+            self.cancel_btn.configure(state=tk.DISABLED)
+            self.status_var.set("正在取消，请等待当前网络请求结束……")
 
     # -- thread-safe output helpers ---------------------------------------
 
@@ -386,36 +312,36 @@ class CorrespondingAuthorGUI:
                 kind, payload = self._output_queue.get_nowait()
                 if kind == "output":
                     self._append_output_now(str(payload))
-                elif kind == "done":
-                    returncode = int(payload)
+                elif kind == "result" and isinstance(payload, SearchResult):
                     self._set_running(False)
-                    if returncode == 0:
-                        self._append_output_now("\n\u2500\u2500 检索完成 \u2500\u2500\n")
-                        # exit code 0 always means success; check if the
-                        # search came back empty so we can give a hint
-                        all_text = self.output_text.get("1.0", tk.END)
-                        if "identity-filtered: 0" in all_text:
-                            self._append_output_now(
-                                "未找到匹配的论文。\n"
-                            )
-                        else:
-                            # Extract results folder path
-                            for line in reversed(all_text.splitlines()):
-                                if line.startswith("Results: "):
-                                    self._results_path = line[len("Results: "):].strip()
-                                    self.open_folder_btn.configure(state=tk.NORMAL)
-                                    break
-                        self.status_var.set("检索完成\u3002")
+                    summary = payload.summary
+                    total = (
+                        summary["explicit"]
+                        + summary["uncertain"]
+                        + summary["excluded_not_corresponding"]
+                    )
+                    self._append_output_now("\n\u2500\u2500 检索完成 \u2500\u2500\n")
+                    if total == 0:
+                        self._append_output_now("未找到匹配的论文。\n")
                     else:
-                        self._append_output_now("\n\u2500\u2500 检索异常 \u2500\u2500\n")
-                        self.status_var.set(
-                            f"检索异常\u7ed3\u675f\uff08\u9000\u51fa\u7801\uff1a{returncode}\uff09\uff0c\u8bf7\u67e5\u770b\u4e0a\u65b9\u65e5\u5fd7\u4e86\u89e3\u8be6\u60c5\u3002"
+                        self._append_output_now(
+                            f"明确通讯作者: {summary['explicit']}  |  "
+                            f"无法确定: {summary['uncertain']}  |  "
+                            f"已排除: {summary['excluded_not_corresponding']}\n"
                         )
+                        if payload.output_dir:
+                            self._results_path = payload.output_dir
+                            self.open_folder_btn.configure(state=tk.NORMAL)
+                    self.status_var.set("检索完成。")
+                    self._cancel_event = None
+                    self._worker_thread = None
                 elif kind == "error":
                     self._append_output_now(f"\n[错误] {payload}\n")
                     self._append_output_now("\u2500\u2500 检索失败 \u2500\u2500\n")
                     self._set_running(False)
-                    self.status_var.set("检索失败\uff0c\u8bf7\u67e5\u770b\u4e0a\u65b9\u65e5\u5fd7\u4e86\u89e3\u8be6\u60c5\u3002")
+                    self.status_var.set("检索失败，请查看上方日志了解详情。")
+                    self._cancel_event = None
+                    self._worker_thread = None
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
@@ -471,7 +397,7 @@ class CorrespondingAuthorGUI:
         return "" if value == placeholder else value
 
     def _on_close(self) -> None:
-        """Handle window close: terminate subprocess and destroy."""
+        """Handle window close: signal cancellation and destroy."""
         self._cancel_search()
         self.root.destroy()
 

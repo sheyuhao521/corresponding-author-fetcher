@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import time
+import threading
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -30,7 +31,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 
 VERSION = "1.1.0"
@@ -197,6 +198,30 @@ class Paper:
 
     def key(self) -> str:
         return f"doi:{self.doi}" if self.doi else f"title:{title_key(self.title)}"
+
+
+@dataclass
+class SearchOptions:
+    name: str
+    institution: str
+    email: str = ""
+    from_year: int = 1900
+    to_year: int | None = None
+    max_per_source: int = 1000
+    skip_semantic_scholar: bool = False
+    semantic_scholar_key: str = ""
+    skip_publisher_page_check: bool = False
+    no_download: bool = False
+    allow_missing_affiliation: bool = False
+    output: str = "author_papers"
+
+
+@dataclass
+class SearchResult:
+    papers: list[Paper]
+    summary: dict[str, int]
+    output_dir: str
+    source_errors: dict[str, str]
 
 
 def crossref_search(name: str, start: int, end: int, limit: int) -> list[Paper]:
@@ -702,56 +727,81 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    prompt_if_missing(args)
-    if args.from_year > args.to_year:
-        raise SystemExit("起始年份不能晚于结束年份")
+def run_search(
+    options: SearchOptions,
+    *,
+    progress_callback: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> SearchResult:
+    if not options.name.strip():
+        raise ValueError("作者姓名不能为空")
+    if not options.institution.strip():
+        raise ValueError("作者单位不能为空")
+
+    to_year = options.to_year
+    if to_year is None:
+        to_year = time.localtime().tm_year
+    if options.from_year > to_year:
+        raise ValueError("起始年份不能晚于结束年份")
+
+    def log(message: str) -> None:
+        if progress_callback is None:
+            print(message, file=sys.stderr)
+        else:
+            progress_callback(message)
+
+    def is_cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
     # Every execution gets its own directory so PDFs and CSVs from an older,
     # looser query can never be mistaken for current strict-filter results.
     run_stamp = time.strftime("%Y%m%d_%H%M%S")
-    run_name = safe_filename(f"{args.name}_{args.from_year}-{args.to_year}_{run_stamp}")
-    output = (Path(args.output).expanduser().resolve() / run_name)
+    run_name = safe_filename(f"{options.name}_{options.from_year}-{to_year}_{run_stamp}")
+    output = (Path(options.output).expanduser().resolve() / run_name)
     output.mkdir(parents=True, exist_ok=True)
 
     collectors = [
-        ("OpenAlex", lambda: openalex_search(args.name, args.institution, args.from_year, args.to_year, args.max_per_source)),
-        ("Crossref", lambda: crossref_search(args.name, args.from_year, args.to_year, args.max_per_source)),
-        ("Europe PMC", lambda: europe_pmc_search(args.name, args.from_year, args.to_year, args.max_per_source)),
+        ("OpenAlex", lambda: openalex_search(options.name, options.institution, options.from_year, to_year, options.max_per_source)),
+        ("Crossref", lambda: crossref_search(options.name, options.from_year, to_year, options.max_per_source)),
+        ("Europe PMC", lambda: europe_pmc_search(options.name, options.from_year, to_year, options.max_per_source)),
     ]
-    if not args.skip_semantic_scholar:
+    if not options.skip_semantic_scholar:
         collectors.append(("Semantic Scholar", lambda: semantic_scholar_search(
-            args.name, args.institution, args.from_year, args.to_year,
-            args.max_per_source, args.semantic_scholar_key)))
+            options.name, options.institution, options.from_year, to_year,
+            options.max_per_source, options.semantic_scholar_key)))
 
     all_items: list[Paper] = []
     source_errors: dict[str, str] = {}
     for source, collect in collectors:
-        print(f"[{source}] searching...", file=sys.stderr)
+        if is_cancelled():
+            break
+        log(f"[{source}] searching...")
         try:
             found = collect()
             all_items.extend(found)
-            print(f"[{source}] {len(found)} candidate records", file=sys.stderr)
+            log(f"[{source}] {len(found)} candidate records")
         except Exception as exc:
             source_errors[source] = str(exc)
-            print(f"[{source}] failed: {exc}", file=sys.stderr)
+            log(f"[{source}] failed: {exc}")
 
     papers, affiliation_mismatch, affiliation_missing = local_identity_filter(
-        merge_papers(all_items), args.name, args.institution, args.from_year, args.to_year,
-        allow_missing=args.allow_missing_affiliation)
-    print(f"Merged and strict identity-filtered: {len(papers)}; "
-          f"affiliation mismatch excluded: {len(affiliation_mismatch)}; "
-          f"affiliation missing excluded: {len(affiliation_missing)}", file=sys.stderr)
+        merge_papers(all_items), options.name, options.institution, options.from_year, to_year,
+        allow_missing=options.allow_missing_affiliation)
+    log(f"Merged and strict identity-filtered: {len(papers)}; "
+        f"affiliation mismatch excluded: {len(affiliation_mismatch)}; "
+        f"affiliation missing excluded: {len(affiliation_missing)}")
     for index, paper in enumerate(papers, 1):
-        print(f"[{index}/{len(papers)}] verifying: {paper.title[:80]}", file=sys.stderr)
+        if is_cancelled():
+            break
+        log(f"[{index}/{len(papers)}] verifying: {paper.title[:80]}")
         apply_structured_correspondence_claims(paper)
-        verify_correspondence_with_jats(paper, args.name, args.email)
+        verify_correspondence_with_jats(paper, options.name, options.email)
         # Unpaywall requires an email parameter; the user's supplied contact email
         # is used only for this API identification and correspondence matching.
-        add_unpaywall_pdf(paper, args.email)
-        if not args.skip_publisher_page_check:
-            verify_correspondence_with_publisher_page(paper, args.name, args.email)
-        if not args.no_download and paper.corresponding_status != "not_corresponding":
+        add_unpaywall_pdf(paper, options.email)
+        if not options.skip_publisher_page_check:
+            verify_correspondence_with_publisher_page(paper, options.name, options.email)
+        if not options.no_download and paper.corresponding_status != "not_corresponding":
             download_pdf(paper, output / paper.corresponding_status / "pdf")
 
     explicit = [p for p in papers if p.corresponding_status == "explicit"]
@@ -763,8 +813,8 @@ def main() -> int:
     write_csv(output / "单位不符_已排除.csv", affiliation_mismatch)
     write_csv(output / "目标作者单位缺失_已排除.csv", affiliation_missing)
     manifest = {
-        "query": {"name": args.name, "institution": args.institution,
-                  "email": args.email, "from_year": args.from_year, "to_year": args.to_year},
+        "query": {"name": options.name, "institution": options.institution,
+                  "email": options.email, "from_year": options.from_year, "to_year": to_year},
         "summary": {"explicit": len(explicit), "uncertain": len(uncertain),
                     "excluded_not_corresponding": len(excluded),
                     "excluded_affiliation_mismatch": len(affiliation_mismatch),
@@ -778,9 +828,38 @@ def main() -> int:
         ],
     }
     (output / "完整结果.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(manifest["summary"], ensure_ascii=False, indent=2))
-    print(f"Results: {output}")
-    return 0 if papers or not source_errors else 2
+    return SearchResult(
+        papers=papers,
+        summary=manifest["summary"],
+        output_dir=str(output),
+        source_errors=source_errors,
+    )
+
+
+def main() -> int:
+    args = parse_args()
+    prompt_if_missing(args)
+    options = SearchOptions(
+        name=args.name,
+        institution=args.institution,
+        email=args.email,
+        from_year=args.from_year,
+        to_year=args.to_year,
+        max_per_source=args.max_per_source,
+        skip_semantic_scholar=args.skip_semantic_scholar,
+        semantic_scholar_key=args.semantic_scholar_key,
+        skip_publisher_page_check=args.skip_publisher_page_check,
+        no_download=args.no_download,
+        allow_missing_affiliation=args.allow_missing_affiliation,
+        output=args.output,
+    )
+    try:
+        result = run_search(options)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(result.summary, ensure_ascii=False, indent=2))
+    print(f"Results: {result.output_dir}")
+    return 0 if result.papers or not result.source_errors else 2
 
 
 if __name__ == "__main__":
